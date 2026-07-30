@@ -104,6 +104,21 @@ public:
     integrator_ = 0.0;
   }
 
+  double get_integrator() const
+  {
+    return integrator_;
+  }
+
+  double get_unsaturated_output() const
+  {
+    return unsaturated_output_;
+  }
+
+  double get_saturated_output() const
+  {
+    return saturated_output_;
+  }
+
 protected:
   double kp_;              //!< the proportional gain
   double ki_;              //!< the integral gain (zero if you don't want integral control)
@@ -115,6 +130,8 @@ protected:
   double differentiator_;  //!< used for noise reduced differentiation
   double last_error_;      //!< the last p_error, for computing the derivative;
   double last_state_;      //!< the last state, for computing the derivative;
+  double unsaturated_output_;  //!< most recent output before saturation
+  double saturated_output_;    //!< most recent output after saturation
 
   /*!
    * \brief saturate saturates the variable val

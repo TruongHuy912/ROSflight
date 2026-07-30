@@ -1,5 +1,7 @@
 #include <controller/controller_cascading_pid.hpp>
 
+#include <limits>
+
 using std::placeholders::_1;
 
 namespace roscopter
@@ -7,6 +9,10 @@ namespace roscopter
 
 ControllerCascadingPID::ControllerCascadingPID() : ControllerStateMachine(), params_initialized_(false)
 {
+  vertical_debug_pub_ =
+    this->create_publisher<roscopter_msgs::msg::VerticalControlDebug>(
+      "/controller/vertical_debug", 10);
+
   // Declare and set parameters associated with Cascading PID controller
   declare_params();
   params.set_parameters();
@@ -220,6 +226,7 @@ rosflight_msgs::msg::Command ControllerCascadingPID::compute_offboard_control(ro
 {
   // Note that dt is "safe", i.e., >0.0000001 as checked in the state machine
   dt_ = dt;
+  initialize_vertical_debug();
 
   uint8_t mode = input_cmd.mode;
 
@@ -276,6 +283,7 @@ rosflight_msgs::msg::Command ControllerCascadingPID::compute_offboard_control(ro
       break;
   }
 
+  publish_vertical_debug();
   return output_cmd_;
 }
 
@@ -343,6 +351,8 @@ void ControllerCascadingPID::npos_epos_dpos_yaw(roscopter_msgs::msg::ControllerC
   double pe = input_cmd.cmd2;
   double pd = input_cmd.cmd3;
   double psi = input_cmd.cmd4;
+  vertical_debug_.p_d_setpoint = pd;
+  vertical_debug_.position_error_d = pd - xhat_.p_d;
 
   // First, determine the shortest direction to the commanded psi (wrap to within 180)
   psi = wrap_within_180(xhat_.psi, psi);
@@ -371,11 +381,18 @@ void ControllerCascadingPID::nvel_evel_dvel_yawrate(roscopter_msgs::msg::Control
   Eigen::Quaterniond q_body_to_inertial(xhat_.quat.w, xhat_.quat.x, xhat_.quat.y, xhat_.quat.z);
   Eigen::Vector3d v_body(xhat_.v_x, xhat_.v_y, xhat_.v_z);
   Eigen::Vector3d v_inertial = q_body_to_inertial * v_body;
+  vertical_debug_.v_d = v_inertial(2);
+  vertical_debug_.v_d_setpoint = vel_d;
+  vertical_debug_.velocity_error_d = vel_d - v_inertial(2);
 
   // Compute desired accelerations (in terms of g's) in the inertial frame
   double a_n = PID_vel_n_to_accel_.compute_pid(vel_n, v_inertial(0), dt_);  // ax
   double a_e = PID_vel_e_to_accel_.compute_pid(vel_e, v_inertial(1), dt_);  // ay
   double a_d = PID_vel_d_to_accel_.compute_pid(vel_d, v_inertial(2), dt_);  // az
+  vertical_debug_.accel_command_unsaturated =
+    PID_vel_d_to_accel_.get_unsaturated_output();
+  vertical_debug_.accel_command_saturated =
+    PID_vel_d_to_accel_.get_saturated_output();
 
   // Rotate inertial frame accelerations to vehicle 1 frame accelerations
   double sin_psi = sin(xhat_.psi);
@@ -438,6 +455,7 @@ void ControllerCascadingPID::facc_racc_dacc_yawrate(roscopter_msgs::msg::Control
   input_cmd.cmd2 = saturate(theta, max_pitch_deg, -max_pitch_deg);     // theta
   input_cmd.cmd3 = r;                                          // r
   input_cmd.cmd4 = desired_accel * equilibrium_throttle;      // throttle
+  vertical_debug_.throttle_unsaturated = input_cmd.cmd4;
 
   pass_to_firmware_controller(input_cmd);
 }
@@ -475,6 +493,8 @@ void ControllerCascadingPID::nvel_evel_dpos_yawrate(roscopter_msgs::msg::Control
   double vel_e = input_cmd.cmd2;
   double pd = input_cmd.cmd3;
   double r = input_cmd.cmd4;
+  vertical_debug_.p_d_setpoint = pd;
+  vertical_debug_.position_error_d = pd - xhat_.p_d;
 
   // Save the calculated velocities to the command and change to the appropriate mode
   input_cmd.mode = roscopter_msgs::msg::ControllerCommand::MODE_NVEL_EVEL_DVEL_YAWRATE;
@@ -551,6 +571,10 @@ void ControllerCascadingPID::pass_to_firmware_controller(roscopter_msgs::msg::Co
   output_cmd_.u[3] = saturate(input_cmd.cmd1, max_x, -max_x);
   output_cmd_.u[4] = saturate(input_cmd.cmd2, max_y, -max_y);
   output_cmd_.u[5] = saturate(input_cmd.cmd3, max_z, -max_z);
+  vertical_debug_.throttle_unsaturated = input_cmd.cmd4;
+  vertical_debug_.throttle_saturated = output_cmd_.u[2];
+  vertical_debug_.throttle_saturated_high = input_cmd.cmd4 > max_f;
+  vertical_debug_.throttle_saturated_low = input_cmd.cmd4 < min_f;
 
   // Check to see if we are above the minimum attitude altitude
   if (abs(xhat_.p_d) < min_altitude_for_attitude_ctrl)
@@ -584,6 +608,36 @@ void ControllerCascadingPID::reset_vertical_integrators()
 {
   PID_vel_d_to_accel_.clear_integrator();
   PID_d_to_vel_.clear_integrator();
+}
+
+void ControllerCascadingPID::initialize_vertical_debug()
+{
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  vertical_debug_ = roscopter_msgs::msg::VerticalControlDebug();
+  vertical_debug_.header = xhat_.header;
+  vertical_debug_.controller_state = get_controller_state();
+  vertical_debug_.p_d = xhat_.p_d;
+  vertical_debug_.p_d_setpoint = nan;
+  vertical_debug_.position_error_d = nan;
+  vertical_debug_.v_d = nan;
+  vertical_debug_.v_d_setpoint = nan;
+  vertical_debug_.velocity_error_d = nan;
+  vertical_debug_.accel_command_unsaturated = nan;
+  vertical_debug_.accel_command_saturated = nan;
+  vertical_debug_.throttle_unsaturated = nan;
+  vertical_debug_.throttle_saturated = nan;
+
+  if (get_controller_state() == TAKEOFF) {
+    const double takeoff_d_pos = params.get_double("takeoff_d_pos");
+    vertical_debug_.p_d_setpoint = takeoff_d_pos;
+    vertical_debug_.position_error_d = takeoff_d_pos - xhat_.p_d;
+  }
+}
+
+void ControllerCascadingPID::publish_vertical_debug()
+{
+  vertical_debug_.velocity_integrator = PID_vel_d_to_accel_.get_integrator();
+  vertical_debug_pub_->publish(vertical_debug_);
 }
 
 }  // namespace controller

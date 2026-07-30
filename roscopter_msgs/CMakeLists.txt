@@ -31,6 +31,7 @@ set(msg_files
   "msg/Bool.msg"
   "msg/State.msg"
   "msg/TrajectoryCommand.msg"
+  "msg/VerticalControlDebug.msg"
   "msg/Waypoint.msg"
 )
 

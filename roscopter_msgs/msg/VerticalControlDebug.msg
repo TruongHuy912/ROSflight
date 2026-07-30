@@ -1,0 +1,15 @@
+std_msgs/Header header
+uint8 controller_state
+float32 p_d
+float32 p_d_setpoint
+float32 position_error_d
+float32 v_d
+float32 v_d_setpoint
+float32 velocity_error_d
+float32 accel_command_unsaturated
+float32 accel_command_saturated
+float32 throttle_unsaturated
+float32 throttle_saturated
+float32 velocity_integrator
+bool throttle_saturated_high
+bool throttle_saturated_low
