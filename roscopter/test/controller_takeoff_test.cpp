@@ -143,6 +143,12 @@ TEST_F(ControllerTakeoffTest, BrakingProfileReducesVelocityNearTarget)
   EXPECT_NEAR(cruise_velocity, -0.5, 1e-6);
   EXPECT_LT(near_target_velocity, 0.0);
   EXPECT_LT(std::abs(near_target_velocity), std::abs(cruise_velocity));
+
+  controller_->set_estimate(-2.0, -0.2);
+  for (int i = 0; i < 10; ++i) {
+    controller_->step(0.1);
+  }
+  EXPECT_NEAR(controller_->last_control_input.cmd3, 0.0, 1e-6);
 }
 
 TEST_F(ControllerTakeoffTest, ZeroRemainingDistanceDoesNotProduceNan)
@@ -166,6 +172,18 @@ TEST_F(ControllerTakeoffTest, PositionAloneDoesNotCompleteSmoothTakeoff)
   for (int i = 0; i < 10; ++i) {
     controller_->step(0.1);
   }
+
+  EXPECT_EQ(controller_->get_controller_state(), TestController::TAKEOFF);
+  EXPECT_EQ(controller_->reset_vertical_integrators_count, 0);
+}
+
+TEST_F(ControllerTakeoffTest, ZeroSettleTimeStillRequiresPositionAndVelocity)
+{
+  controller_->configure_smooth_takeoff(0.1, 0.1, 0.1, 0.0);
+  controller_->start_takeoff();
+  controller_->set_estimate(0.0, 0.0);
+
+  controller_->step(0.1);
 
   EXPECT_EQ(controller_->get_controller_state(), TestController::TAKEOFF);
   EXPECT_EQ(controller_->reset_vertical_integrators_count, 0);

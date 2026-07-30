@@ -185,7 +185,10 @@ rosflight_msgs::msg::Command ControllerStateMachine::manage_takeoff(double dt)
     }
 
     takeoff_complete =
-      takeoff_settle_elapsed_ >= std::max(0.0, params.get_double("takeoff_settle_time"));
+      position_settled &&
+      velocity_settled &&
+      takeoff_settle_elapsed_ >=
+      std::max(0.0, params.get_double("takeoff_settle_time"));
   } else {
     // Preserve the original position-only completion check.
     takeoff_complete = std::abs(xhat_.p_d - takeoff_d_pos) <= takeoff_height_threshold;
