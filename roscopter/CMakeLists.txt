@@ -110,14 +110,20 @@ target_link_libraries(ext_att_transcriber ${ament_LIBRARIES})
 install(TARGETS ext_att_transcriber
   DESTINATION lib/${PROJECT_NAME})
 
-# Controller
-add_executable(controller
+# Controller library
+add_library(controller_lib STATIC
   src/controller/controller_ros.cpp
   src/controller/controller_state_machine.cpp
   src/controller/controller_cascading_pid.cpp
   src/controller/simple_pid.cpp)
-ament_target_dependencies(controller rclcpp rclpy roscopter_msgs rosflight_msgs Eigen3)
-target_link_libraries(controller ${ament_LIBRARIES} param_manager)
+ament_target_dependencies(controller_lib rclcpp rclpy roscopter_msgs rosflight_msgs Eigen3)
+target_link_libraries(controller_lib ${ament_LIBRARIES} param_manager)
+
+# Controller
+add_executable(controller
+  src/controller/controller_node.cpp)
+ament_target_dependencies(controller rclcpp)
+target_link_libraries(controller controller_lib)
 install(
   TARGETS controller
   DESTINATION lib/${PROJECT_NAME})
@@ -162,6 +168,15 @@ if(BUILD_TESTING)
     include
   )
   target_link_libraries(estimator_test estimation_lib param_manager) 
+
+  ament_add_gtest(controller_takeoff_test test/controller_takeoff_test.cpp)
+  ament_target_dependencies(
+    controller_takeoff_test
+    rclcpp
+    roscopter_msgs
+    rosflight_msgs)
+  target_include_directories(controller_takeoff_test PUBLIC include)
+  target_link_libraries(controller_takeoff_test controller_lib)
 
   find_package(ament_lint_auto REQUIRED)
   # the following line skips the linter which checks for copyrights

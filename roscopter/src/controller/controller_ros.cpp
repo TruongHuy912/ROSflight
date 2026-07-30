@@ -1,5 +1,4 @@
 #include <controller/controller_ros.hpp>
-#include <controller/controller_cascading_pid.hpp>
 
 using std::placeholders::_1;
 
@@ -114,16 +113,3 @@ double ControllerROS::wrap_within_180(double fixed, double angle_to_wrap)
 }
 
 }  // namespace controller
-
-
-int main(int argc, char* argv[])
-{
-  rclcpp::init(argc, argv);
-
-  auto node = std::make_shared<roscopter::ControllerCascadingPID>();
-  RCLCPP_INFO_ONCE(node->get_logger(), "Using default (cascading PID) controller");
-  rclcpp::spin(node);
-  rclcpp::shutdown();
-
-  return 0;
-}
