@@ -87,6 +87,11 @@
     takeoff_height_threshold: 1.0
     takeoff_d_vel: -0.5
     takeoff_landing_pos_hold_time: 1.0
+    smooth_takeoff_enabled: false
+    takeoff_max_accel: 0.10
+    takeoff_position_tolerance: 0.10
+    takeoff_velocity_tolerance: 0.10
+    takeoff_settle_time: 1.0
     min_altitude_for_attitude_ctrl: 0.30
 
 
@@ -116,4 +121,3 @@
     max_acceleration: 5.0
     max_velocity: 3.0
     default_altitude: 10.0
-

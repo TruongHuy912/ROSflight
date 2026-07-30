@@ -580,5 +580,10 @@ void ControllerCascadingPID::reset_integrators()
   PID_yaw_rate_to_torque_.clear_integrator();
 }
 
-}  // namespace controller
+void ControllerCascadingPID::reset_vertical_integrators()
+{
+  PID_vel_d_to_accel_.clear_integrator();
+  PID_d_to_vel_.clear_integrator();
+}
 
+}  // namespace controller

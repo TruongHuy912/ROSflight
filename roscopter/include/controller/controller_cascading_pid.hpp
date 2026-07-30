@@ -54,6 +54,7 @@ private:
   // Functions
   rosflight_msgs::msg::Command compute_offboard_control(roscopter_msgs::msg::ControllerCommand & input_cmd, double dt);
   void reset_integrators();
+  void reset_vertical_integrators() override;
   void update_gains() override;
   // double calculate_max_xy_accel(double max_accel_z, double equilibrium_throttle);
 
