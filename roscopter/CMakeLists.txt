@@ -178,6 +178,12 @@ if(BUILD_TESTING)
   target_include_directories(controller_takeoff_test PUBLIC include)
   target_link_libraries(controller_takeoff_test controller_lib)
 
+  find_package(launch_testing_ament_cmake REQUIRED)
+  add_launch_test(
+    test/smooth_takeoff_sim_launch_test.py
+    TARGET smooth_takeoff_sim_integration
+    TIMEOUT 90)
+
   find_package(ament_lint_auto REQUIRED)
   # the following line skips the linter which checks for copyrights
   # comment the line when a copyright and license is added to all source files
