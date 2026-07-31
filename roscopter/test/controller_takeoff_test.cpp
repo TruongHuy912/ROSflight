@@ -52,8 +52,37 @@ public:
       rclcpp::Parameter("takeoff_max_accel", max_accel),
       rclcpp::Parameter("takeoff_position_tolerance", position_tolerance),
       rclcpp::Parameter("takeoff_velocity_tolerance", velocity_tolerance),
-      rclcpp::Parameter("takeoff_settle_time", settle_time)
+      rclcpp::Parameter("takeoff_settle_time", settle_time),
+      rclcpp::Parameter("takeoff_timeout", 15.0),
+      rclcpp::Parameter("takeoff_max_overshoot", 1.0),
+      rclcpp::Parameter("takeoff_low_saturation_timeout", 1.0),
+      rclcpp::Parameter("takeoff_runaway_velocity", 1.0)
     });
+  }
+
+  void configure_takeoff_safety(
+    double timeout,
+    double max_overshoot,
+    double low_saturation_timeout,
+    double runaway_velocity)
+  {
+    set_parameters({
+      rclcpp::Parameter("takeoff_timeout", timeout),
+      rclcpp::Parameter("takeoff_max_overshoot", max_overshoot),
+      rclcpp::Parameter(
+        "takeoff_low_saturation_timeout", low_saturation_timeout),
+      rclcpp::Parameter("takeoff_runaway_velocity", runaway_velocity)
+    });
+  }
+
+  void set_low_throttle_saturation(bool saturated)
+  {
+    low_throttle_saturated_ = saturated;
+  }
+
+  bool takeoff_throttle_limit_active() const
+  {
+    return is_takeoff_throttle_limit_active();
   }
 
   roscopter_msgs::msg::ControllerCommand last_control_input;
@@ -63,13 +92,16 @@ public:
 private:
   roscopter_msgs::msg::ControllerCommand input_command_;
   rosflight_msgs::msg::Status status_;
+  bool low_throttle_saturated_ = false;
 
   rosflight_msgs::msg::Command compute_offboard_control(
     roscopter_msgs::msg::ControllerCommand & input_cmd,
     double) override
   {
     last_control_input = input_cmd;
-    return rosflight_msgs::msg::Command();
+    rosflight_msgs::msg::Command output;
+    output.u[2] = low_throttle_saturated_ ? 0.4 : 0.65;
+    return output;
   }
 
   void reset_integrators() override
@@ -80,6 +112,11 @@ private:
   void reset_vertical_integrators() override
   {
     ++reset_vertical_integrators_count;
+  }
+
+  bool is_throttle_saturated_low() const override
+  {
+    return low_throttle_saturated_;
   }
 
   void update_gains() override {}
@@ -124,7 +161,7 @@ TEST_F(ControllerTakeoffTest, RampNeverExceedsAccelerationLimit)
   }
 }
 
-TEST_F(ControllerTakeoffTest, BrakingProfileReducesVelocityNearTarget)
+TEST_F(ControllerTakeoffTest, SwitchesFromVelocityRampToPositionCapture)
 {
   controller_->configure_smooth_takeoff();
   controller_->start_takeoff();
@@ -132,23 +169,23 @@ TEST_F(ControllerTakeoffTest, BrakingProfileReducesVelocityNearTarget)
   for (int i = 0; i < 50; ++i) {
     controller_->step(0.1);
   }
-  const double cruise_velocity = controller_->last_control_input.cmd3;
+  EXPECT_EQ(
+    controller_->last_control_input.mode,
+    roscopter_msgs::msg::ControllerCommand::MODE_NPOS_EPOS_DVEL_YAW);
+  EXPECT_EQ(
+    controller_->get_takeoff_phase(),
+    TestController::TAKEOFF_RAMP);
 
-  controller_->set_estimate(-1.99, -0.2);
-  for (int i = 0; i < 50; ++i) {
-    controller_->step(0.1);
-  }
-  const double near_target_velocity = controller_->last_control_input.cmd3;
+  controller_->set_estimate(-0.8, -0.2);
+  controller_->step(0.1);
 
-  EXPECT_NEAR(cruise_velocity, -0.5, 1e-6);
-  EXPECT_LT(near_target_velocity, 0.0);
-  EXPECT_LT(std::abs(near_target_velocity), std::abs(cruise_velocity));
-
-  controller_->set_estimate(-2.0, -0.2);
-  for (int i = 0; i < 10; ++i) {
-    controller_->step(0.1);
-  }
-  EXPECT_NEAR(controller_->last_control_input.cmd3, 0.0, 1e-6);
+  EXPECT_EQ(
+    controller_->get_takeoff_phase(),
+    TestController::TAKEOFF_CAPTURE);
+  EXPECT_EQ(
+    controller_->last_control_input.mode,
+    roscopter_msgs::msg::ControllerCommand::MODE_NPOS_EPOS_DPOS_YAW);
+  EXPECT_DOUBLE_EQ(controller_->last_control_input.cmd3, -2.0);
 }
 
 TEST_F(ControllerTakeoffTest, ZeroRemainingDistanceDoesNotProduceNan)
@@ -160,7 +197,10 @@ TEST_F(ControllerTakeoffTest, ZeroRemainingDistanceDoesNotProduceNan)
   controller_->step(0.1);
 
   EXPECT_TRUE(std::isfinite(controller_->last_control_input.cmd3));
-  EXPECT_DOUBLE_EQ(controller_->last_control_input.cmd3, 0.0);
+  EXPECT_EQ(
+    controller_->last_control_input.mode,
+    roscopter_msgs::msg::ControllerCommand::MODE_NPOS_EPOS_DPOS_YAW);
+  EXPECT_DOUBLE_EQ(controller_->last_control_input.cmd3, -2.0);
 }
 
 TEST_F(ControllerTakeoffTest, PositionAloneDoesNotCompleteSmoothTakeoff)
@@ -201,10 +241,31 @@ TEST_F(ControllerTakeoffTest, CompletesOnlyAfterContinuousSettleTime)
 
   controller_->step(0.1);
   EXPECT_EQ(controller_->get_controller_state(), TestController::POSITION_HOLD);
-  EXPECT_EQ(controller_->reset_vertical_integrators_count, 1);
+  EXPECT_EQ(controller_->reset_vertical_integrators_count, 0);
 
   controller_->step(0.1);
-  EXPECT_EQ(controller_->reset_vertical_integrators_count, 1);
+  EXPECT_EQ(controller_->reset_vertical_integrators_count, 0);
+}
+
+TEST_F(
+  ControllerTakeoffTest,
+  TakeoffThrottleLimitPersistsThroughHoldAndClearsForOffboard)
+{
+  controller_->configure_smooth_takeoff(0.1, 0.1, 0.1, 0.1);
+  controller_->start_takeoff();
+  EXPECT_TRUE(controller_->takeoff_throttle_limit_active());
+
+  controller_->set_estimate(-2.0, 0.0);
+  controller_->step(0.1);
+  ASSERT_EQ(
+    controller_->get_controller_state(),
+    TestController::POSITION_HOLD);
+  EXPECT_TRUE(controller_->takeoff_throttle_limit_active());
+
+  controller_->set_estimate(-2.0, 0.0, 3.1);
+  controller_->step(0.1);
+  ASSERT_EQ(controller_->get_controller_state(), TestController::OFFBOARD);
+  EXPECT_FALSE(controller_->takeoff_throttle_limit_active());
 }
 
 TEST_F(ControllerTakeoffTest, SettleTimerResetsWhenConditionIsBroken)
@@ -244,6 +305,124 @@ TEST_F(ControllerTakeoffTest, DisabledSmoothTakeoffPreservesLegacyBehavior)
   controller_->step(0.1);
   EXPECT_EQ(controller_->get_controller_state(), TestController::POSITION_HOLD);
   EXPECT_EQ(controller_->reset_vertical_integrators_count, 1);
+}
+
+TEST_F(ControllerTakeoffTest, PersistentLowThrottleSaturationAbortsTakeoff)
+{
+  controller_->configure_smooth_takeoff();
+  controller_->configure_takeoff_safety(10.0, 10.0, 0.3, 5.0);
+  controller_->start_takeoff();
+  controller_->set_low_throttle_saturation(true);
+
+  controller_->set_estimate(-0.2, -0.1);
+  controller_->step(0.1);
+  controller_->set_estimate(-0.3, -0.2);
+  controller_->step(0.1);
+  controller_->set_estimate(-0.4, -0.3);
+  controller_->step(0.1);
+
+  EXPECT_EQ(
+    controller_->get_controller_state(),
+    TestController::TAKEOFF_ABORT);
+  EXPECT_EQ(
+    controller_->get_takeoff_abort_reason(),
+    TestController::TAKEOFF_ABORT_LOW_THROTTLE_SATURATION);
+  EXPECT_EQ(controller_->reset_vertical_integrators_count, 1);
+}
+
+TEST_F(ControllerTakeoffTest, RunawayUpwardVelocityAbortsTakeoff)
+{
+  controller_->configure_smooth_takeoff();
+  controller_->configure_takeoff_safety(10.0, 10.0, 10.0, 1.0);
+  controller_->start_takeoff();
+  controller_->set_estimate(-0.5, -1.1);
+
+  controller_->step(0.1);
+
+  EXPECT_EQ(
+    controller_->get_controller_state(),
+    TestController::TAKEOFF_ABORT);
+  EXPECT_EQ(
+    controller_->get_takeoff_abort_reason(),
+    TestController::TAKEOFF_ABORT_RUNAWAY_VELOCITY);
+}
+
+TEST_F(ControllerTakeoffTest, ExcessiveAltitudeOvershootAbortsTakeoff)
+{
+  controller_->configure_smooth_takeoff();
+  controller_->configure_takeoff_safety(10.0, 0.5, 10.0, 10.0);
+  controller_->start_takeoff();
+  controller_->set_estimate(-2.6, -0.2);
+
+  controller_->step(0.1);
+
+  EXPECT_EQ(
+    controller_->get_controller_state(),
+    TestController::TAKEOFF_ABORT);
+  EXPECT_EQ(
+    controller_->get_takeoff_abort_reason(),
+    TestController::TAKEOFF_ABORT_ALTITUDE_OVERSHOOT);
+}
+
+TEST_F(ControllerTakeoffTest, TakeoffTimeoutUsesFallbackTransition)
+{
+  controller_->configure_smooth_takeoff();
+  controller_->configure_takeoff_safety(0.3, 10.0, 10.0, 10.0);
+  controller_->start_takeoff();
+
+  controller_->step(0.1);
+  controller_->step(0.1);
+  controller_->step(0.1);
+
+  EXPECT_EQ(
+    controller_->get_controller_state(),
+    TestController::TAKEOFF_ABORT);
+  EXPECT_EQ(
+    controller_->get_takeoff_phase(),
+    TestController::TAKEOFF_PHASE_ABORTED);
+  EXPECT_EQ(
+    controller_->get_takeoff_abort_reason(),
+    TestController::TAKEOFF_ABORT_TIMEOUT);
+  EXPECT_EQ(controller_->reset_vertical_integrators_count, 1);
+}
+
+TEST_F(ControllerTakeoffTest, SmoothTakeoffCannotRemainActiveIndefinitely)
+{
+  controller_->configure_smooth_takeoff();
+  controller_->configure_takeoff_safety(0.5, 10.0, 10.0, 10.0);
+  controller_->start_takeoff();
+
+  for (int i = 0; i < 20; ++i) {
+    controller_->step(0.1);
+  }
+
+  EXPECT_NE(controller_->get_controller_state(), TestController::TAKEOFF);
+}
+
+TEST_F(ControllerTakeoffTest, LegacyModeDoesNotEnableNewSafetyTransitions)
+{
+  controller_->set_parameters({
+    rclcpp::Parameter("smooth_takeoff_enabled", false),
+    rclcpp::Parameter("takeoff_d_pos", -2.0),
+    rclcpp::Parameter("takeoff_d_vel", -0.5),
+    rclcpp::Parameter("takeoff_height_threshold", 0.1),
+    rclcpp::Parameter("takeoff_timeout", 0.1),
+    rclcpp::Parameter("takeoff_max_overshoot", 0.1),
+    rclcpp::Parameter("takeoff_low_saturation_timeout", 0.1),
+    rclcpp::Parameter("takeoff_runaway_velocity", 0.1)
+  });
+  controller_->start_takeoff();
+  controller_->set_low_throttle_saturation(true);
+  controller_->set_estimate(-4.0, -5.0);
+
+  for (int i = 0; i < 10; ++i) {
+    controller_->step(0.1);
+  }
+
+  EXPECT_EQ(controller_->get_controller_state(), TestController::TAKEOFF);
+  EXPECT_EQ(
+    controller_->get_takeoff_abort_reason(),
+    TestController::TAKEOFF_ABORT_NONE);
 }
 
 }  // namespace
