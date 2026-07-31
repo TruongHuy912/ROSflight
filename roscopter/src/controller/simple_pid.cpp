@@ -161,5 +161,11 @@ void SimplePID::set_gains(double p, double i, double d, double tau, double max_u
   }
 }
 
+void SimplePID::set_limits(double max, double min)
+{
+  max_ = std::max(max, min);
+  min_ = std::min(max, min);
+}
+
 
 }  // namespace roscopter

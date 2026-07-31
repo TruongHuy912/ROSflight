@@ -78,6 +78,9 @@
 
     max_throttle: 0.85
     min_throttle: 0.4
+    # Negative means inherit min_throttle. Set lower only in a simulation
+    # parameter override; hardware limits are otherwise unchanged.
+    takeoff_min_throttle: -1.0
 
     max_descend_accel: 0.5  # in g's
     max_descend_rate: 3.0
@@ -92,6 +95,10 @@
     takeoff_position_tolerance: 0.10
     takeoff_velocity_tolerance: 0.10
     takeoff_settle_time: 1.0
+    takeoff_timeout: 15.0
+    takeoff_max_overshoot: 1.0
+    takeoff_low_saturation_timeout: 1.0
+    takeoff_runaway_velocity: 1.0
     min_altitude_for_attitude_ctrl: 0.30
 
 

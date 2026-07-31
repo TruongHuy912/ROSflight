@@ -7,7 +7,10 @@ using std::placeholders::_1;
 namespace roscopter
 {
 
-ControllerCascadingPID::ControllerCascadingPID() : ControllerStateMachine(), params_initialized_(false)
+ControllerCascadingPID::ControllerCascadingPID()
+  : ControllerStateMachine(),
+    params_initialized_(false),
+    vertical_debug_initialized_(false)
 {
   vertical_debug_pub_ =
     this->create_publisher<roscopter_msgs::msg::VerticalControlDebug>(
@@ -106,6 +109,9 @@ void ControllerCascadingPID::declare_params() {
   params.declare_double("equilibrium_throttle", 0.45); 
   params.declare_double("max_throttle", 0.85);
   params.declare_double("min_throttle", 0.05);
+  // A negative value means "inherit min_throttle". A lower non-negative
+  // value must be configured explicitly and is applied only during takeoff.
+  params.declare_double("takeoff_min_throttle", -1.0);
 
   params.declare_double("min_altitude_for_attitude_ctrl", 0.15);
 }
@@ -170,12 +176,6 @@ void ControllerCascadingPID::update_gains() {
   max = params.get_double("max_yaw_rate_deg");
   PID_yaw_to_rate_.set_gains(P, I, D, tau, max, -max);
 
-  // Calculate max accelerations. Assuming that equilibrium throttle produces
-  // 1 g of acceleration and a linear thrust model, these max acceleration
-  // values are computed in g's as well.
-  double equilibrium_throttle = params.get_double("equilibrium_throttle");
-  double max_accel_z = 1.0 / equilibrium_throttle;
-
   // North velocity to accel PID loop
   P = params.get_double("vel_n_to_accel_kp");
   I = params.get_double("vel_n_to_accel_ki");
@@ -192,10 +192,8 @@ void ControllerCascadingPID::update_gains() {
   P = params.get_double("vel_d_to_accel_kp");
   I = params.get_double("vel_d_to_accel_ki");
   D = params.get_double("vel_d_to_accel_kd");
-  // set max z accelerations so that we can't fall faster than 1 gravity
-  max = max_accel_z;
-  double min = params.get_double("max_descend_accel");
-  PID_vel_d_to_accel_.set_gains(P, I, D, tau, min, -max);
+  PID_vel_d_to_accel_.set_gains(P, I, D, tau);
+  update_vertical_acceleration_limits();
 
   // North position to velocity PID loop
   P = params.get_double("pos_n_to_vel_kp");
@@ -283,7 +281,6 @@ rosflight_msgs::msg::Command ControllerCascadingPID::compute_offboard_control(ro
       break;
   }
 
-  publish_vertical_debug();
   return output_cmd_;
 }
 
@@ -371,6 +368,8 @@ void ControllerCascadingPID::npos_epos_dpos_yaw(roscopter_msgs::msg::ControllerC
 
 void ControllerCascadingPID::nvel_evel_dvel_yawrate(roscopter_msgs::msg::ControllerCommand input_cmd)
 {
+  update_vertical_acceleration_limits();
+
   // Expressed in inertial frame
   double vel_n = input_cmd.cmd1;
   double vel_e = input_cmd.cmd2;
@@ -525,7 +524,7 @@ void ControllerCascadingPID::pass_to_firmware_controller(roscopter_msgs::msg::Co
   double min_altitude_for_attitude_ctrl = params.get_double("min_altitude_for_attitude_ctrl");
   double max_x, max_y, max_z, max_f, min_f;
   max_f = params.get_double("max_throttle");
-  min_f = params.get_double("min_throttle");
+  min_f = get_active_min_throttle();
 
   // Set the mode and saturation limits
   if (input_cmd.mode == roscopter_msgs::msg::ControllerCommand::MODE_PASS_THROUGH_TO_MIXER) {
@@ -615,7 +614,7 @@ void ControllerCascadingPID::initialize_vertical_debug()
   const float nan = std::numeric_limits<float>::quiet_NaN();
   vertical_debug_ = roscopter_msgs::msg::VerticalControlDebug();
   vertical_debug_.header = xhat_.header;
-  vertical_debug_.controller_state = get_controller_state();
+  vertical_debug_initialized_ = true;
   vertical_debug_.p_d = xhat_.p_d;
   vertical_debug_.p_d_setpoint = nan;
   vertical_debug_.position_error_d = nan;
@@ -626,6 +625,7 @@ void ControllerCascadingPID::initialize_vertical_debug()
   vertical_debug_.accel_command_saturated = nan;
   vertical_debug_.throttle_unsaturated = nan;
   vertical_debug_.throttle_saturated = nan;
+  vertical_debug_.actual_output_command_u2 = nan;
 
   if (get_controller_state() == TAKEOFF) {
     const double takeoff_d_pos = params.get_double("takeoff_d_pos");
@@ -634,10 +634,69 @@ void ControllerCascadingPID::initialize_vertical_debug()
   }
 }
 
+bool ControllerCascadingPID::is_throttle_saturated_low() const
+{
+  return vertical_debug_.throttle_saturated_low;
+}
+
+void ControllerCascadingPID::finalize_control_cycle(
+  const rosflight_msgs::msg::Command & output_cmd)
+{
+  if (!vertical_debug_initialized_) {
+    return;
+  }
+
+  vertical_debug_.controller_state = get_controller_state();
+  vertical_debug_.takeoff_phase = get_takeoff_phase();
+  vertical_debug_.takeoff_elapsed_time = get_takeoff_elapsed_time();
+  vertical_debug_.low_throttle_saturation_elapsed =
+    get_low_throttle_saturation_elapsed();
+  vertical_debug_.takeoff_abort_reason = get_takeoff_abort_reason();
+  vertical_debug_.actual_output_command_u2 = output_cmd.u[2];
+  publish_vertical_debug();
+  vertical_debug_initialized_ = false;
+}
+
 void ControllerCascadingPID::publish_vertical_debug()
 {
   vertical_debug_.velocity_integrator = PID_vel_d_to_accel_.get_integrator();
   vertical_debug_pub_->publish(vertical_debug_);
+}
+
+double ControllerCascadingPID::get_active_min_throttle()
+{
+  const double min_throttle = params.get_double("min_throttle");
+  const double configured_takeoff_min =
+    params.get_double("takeoff_min_throttle");
+  const double requested_min =
+    is_takeoff_throttle_limit_active() &&
+    configured_takeoff_min >= 0.0 ?
+    configured_takeoff_min : min_throttle;
+  return std::max(
+    0.0,
+    std::min(requested_min, params.get_double("max_throttle")));
+}
+
+void ControllerCascadingPID::update_vertical_acceleration_limits()
+{
+  const double equilibrium_throttle =
+    params.get_double("equilibrium_throttle");
+  if (equilibrium_throttle <= 1e-6) {
+    return;
+  }
+
+  // throttle = equilibrium_throttle * (1 - accel_down)
+  const double throttle_limited_max_down_accel =
+    1.0 - get_active_min_throttle() / equilibrium_throttle;
+  const double throttle_limited_min_down_accel =
+    1.0 - params.get_double("max_throttle") / equilibrium_throttle;
+  const double max_down_accel = std::min(
+    std::max(0.0, params.get_double("max_descend_accel")),
+    throttle_limited_max_down_accel);
+
+  PID_vel_d_to_accel_.set_limits(
+    std::max(max_down_accel, throttle_limited_min_down_accel),
+    throttle_limited_min_down_accel);
 }
 
 }  // namespace controller

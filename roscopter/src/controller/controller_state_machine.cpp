@@ -13,8 +13,15 @@ ControllerStateMachine::ControllerStateMachine()
     state_transition_(false),
     state_(DISARM),
     do_land_(false),
+    takeoff_start_d_pos_(0.0),
     takeoff_velocity_setpoint_(0.0),
-    takeoff_settle_elapsed_(0.0)
+    takeoff_settle_elapsed_(0.0),
+    takeoff_elapsed_time_(0.0),
+    low_throttle_saturation_elapsed_(0.0),
+    low_saturation_start_upward_speed_(0.0),
+    takeoff_phase_(TAKEOFF_PHASE_INACTIVE),
+    takeoff_abort_reason_(TAKEOFF_ABORT_NONE),
+    takeoff_throttle_limit_active_(false)
 {
   declare_params();
   params.set_parameters();
@@ -31,6 +38,10 @@ void ControllerStateMachine::declare_params()
   params.declare_double("takeoff_position_tolerance", 0.10);
   params.declare_double("takeoff_velocity_tolerance", 0.10);
   params.declare_double("takeoff_settle_time", 1.0);
+  params.declare_double("takeoff_timeout", 15.0);
+  params.declare_double("takeoff_max_overshoot", 1.0);
+  params.declare_double("takeoff_low_saturation_timeout", 1.0);
+  params.declare_double("takeoff_runaway_velocity", 1.0);
 }
 
 void ControllerStateMachine::update_gains() {
@@ -70,6 +81,7 @@ rosflight_msgs::msg::Command ControllerStateMachine::manage_state(roscopter_msgs
 
       if (!input_cmd.cmd_valid) {
         state_ = POSITION_HOLD;
+        takeoff_throttle_limit_active_ = false;
       }
       break;
 
@@ -88,6 +100,14 @@ rosflight_msgs::msg::Command ControllerStateMachine::manage_state(roscopter_msgs
       output_command = manage_landing();
       break;
 
+    case TAKEOFF_ABORT:
+      RCLCPP_ERROR_STREAM_EXPRESSION(
+        this->get_logger(), state_transition_,
+        "TAKEOFF_ABORT mode; holding takeoff target until disarm");
+      state_transition_ = false;
+      output_command = manage_takeoff_abort(dt);
+      break;
+
     default:
       state_ = DISARM;
       break;
@@ -96,6 +116,8 @@ rosflight_msgs::msg::Command ControllerStateMachine::manage_state(roscopter_msgs
   // Check to see if the disarmed
   if (!status_msg.armed) {
     state_ = DISARM;
+    takeoff_phase_ = TAKEOFF_PHASE_INACTIVE;
+    takeoff_throttle_limit_active_ = false;
   }
 
   // Check to see if control is valid
@@ -105,6 +127,7 @@ rosflight_msgs::msg::Command ControllerStateMachine::manage_state(roscopter_msgs
   //   RCLCPP_WARN_STREAM(this->get_logger(), "Entering POSITION_HOLD due to invalid input commands.");
   // }
 
+  finalize_control_cycle(output_command);
   return output_command;
 }
 
@@ -118,6 +141,31 @@ double ControllerStateMachine::get_takeoff_velocity_setpoint() const
   return takeoff_velocity_setpoint_;
 }
 
+uint8_t ControllerStateMachine::get_takeoff_phase() const
+{
+  return static_cast<uint8_t>(takeoff_phase_);
+}
+
+double ControllerStateMachine::get_takeoff_elapsed_time() const
+{
+  return takeoff_elapsed_time_;
+}
+
+double ControllerStateMachine::get_low_throttle_saturation_elapsed() const
+{
+  return low_throttle_saturation_elapsed_;
+}
+
+uint8_t ControllerStateMachine::get_takeoff_abort_reason() const
+{
+  return static_cast<uint8_t>(takeoff_abort_reason_);
+}
+
+bool ControllerStateMachine::is_takeoff_throttle_limit_active() const
+{
+  return takeoff_throttle_limit_active_;
+}
+
 void ControllerStateMachine::manage_disarm(bool armed, bool cmd_valid)
 {
   if (armed && cmd_valid) {
@@ -126,10 +174,20 @@ void ControllerStateMachine::manage_disarm(bool armed, bool cmd_valid)
     takeoff_n_pos_ = xhat_.p_n;
     takeoff_e_pos_ = xhat_.p_e;
     takeoff_yaw_ = xhat_.psi;
+    takeoff_start_d_pos_ = xhat_.p_d;
     takeoff_velocity_setpoint_ = 0.0;
     takeoff_settle_elapsed_ = 0.0;
+    takeoff_elapsed_time_ = 0.0;
+    low_throttle_saturation_elapsed_ = 0.0;
+    low_saturation_start_upward_speed_ = 0.0;
+    takeoff_phase_ =
+      params.get_bool("smooth_takeoff_enabled") ?
+      TAKEOFF_RAMP : TAKEOFF_PHASE_INACTIVE;
+    takeoff_abort_reason_ = TAKEOFF_ABORT_NONE;
+    takeoff_throttle_limit_active_ = true;
   }
   else {
+    takeoff_throttle_limit_active_ = false;
     RCLCPP_WARN_STREAM_EXPRESSION(this->get_logger(), !state_transition_, 
       "OFFBOARD CONTROLLER INACTIVE");
     state_transition_ = true;
@@ -149,11 +207,26 @@ rosflight_msgs::msg::Command ControllerStateMachine::manage_takeoff(double dt)
   bool takeoff_complete = false;
 
   if (smooth_takeoff_enabled) {
-    takeoff_velocity_setpoint_ = update_smooth_takeoff_velocity(
-      takeoff_d_pos,
-      takeoff_d_vel,
-      params.get_double("takeoff_max_accel"),
-      dt);
+    takeoff_elapsed_time_ += std::max(0.0, dt);
+
+    if (
+      takeoff_phase_ == TAKEOFF_RAMP &&
+      should_enter_takeoff_capture(
+        takeoff_d_pos,
+        takeoff_d_vel,
+        params.get_double("takeoff_max_accel")))
+    {
+      takeoff_phase_ = TAKEOFF_CAPTURE;
+      takeoff_settle_elapsed_ = 0.0;
+    }
+
+    if (takeoff_phase_ == TAKEOFF_RAMP) {
+      takeoff_velocity_setpoint_ = update_smooth_takeoff_velocity(
+        takeoff_d_pos,
+        takeoff_d_vel,
+        params.get_double("takeoff_max_accel"),
+        dt);
+    }
   } else {
     // Preserve the original fixed-velocity takeoff behavior.
     takeoff_velocity_setpoint_ = takeoff_d_vel;
@@ -161,10 +234,15 @@ rosflight_msgs::msg::Command ControllerStateMachine::manage_takeoff(double dt)
 
   // Create high_level_command
   roscopter_msgs::msg::ControllerCommand input_cmd;
-  input_cmd.mode = roscopter_msgs::msg::ControllerCommand::MODE_NPOS_EPOS_DVEL_YAW;
+  input_cmd.mode =
+    smooth_takeoff_enabled && takeoff_phase_ == TAKEOFF_CAPTURE ?
+    roscopter_msgs::msg::ControllerCommand::MODE_NPOS_EPOS_DPOS_YAW :
+    roscopter_msgs::msg::ControllerCommand::MODE_NPOS_EPOS_DVEL_YAW;
   input_cmd.cmd1 = takeoff_n_pos_;
   input_cmd.cmd2 = takeoff_e_pos_;
-  input_cmd.cmd3 = takeoff_velocity_setpoint_;
+  input_cmd.cmd3 =
+    smooth_takeoff_enabled && takeoff_phase_ == TAKEOFF_CAPTURE ?
+    takeoff_d_pos : takeoff_velocity_setpoint_;
   input_cmd.cmd4 = takeoff_yaw_;
 
   // Compute command
@@ -178,27 +256,140 @@ rosflight_msgs::msg::Command ControllerStateMachine::manage_takeoff(double dt)
     const bool velocity_settled =
       std::abs(velocity_d) <= params.get_double("takeoff_velocity_tolerance");
 
-    if (position_settled && velocity_settled) {
+    if (
+      takeoff_phase_ == TAKEOFF_CAPTURE &&
+      position_settled &&
+      velocity_settled)
+    {
       takeoff_settle_elapsed_ += dt;
     } else {
       takeoff_settle_elapsed_ = 0.0;
     }
 
     takeoff_complete =
+      takeoff_phase_ == TAKEOFF_CAPTURE &&
       position_settled &&
       velocity_settled &&
       takeoff_settle_elapsed_ >=
       std::max(0.0, params.get_double("takeoff_settle_time"));
+
+    update_takeoff_safety(velocity_d, dt);
   } else {
     // Preserve the original position-only completion check.
     takeoff_complete = std::abs(xhat_.p_d - takeoff_d_pos) <= takeoff_height_threshold;
   }
 
   // Change state
-  if (takeoff_complete) {
+  if (takeoff_complete && state_ == TAKEOFF) {
     transition_to_position_hold();
   }
   return output_cmd;
+}
+
+bool ControllerStateMachine::should_enter_takeoff_capture(
+  double target_position_d,
+  double cruise_velocity_d,
+  double max_accel)
+{
+  const double travel_d = target_position_d - takeoff_start_d_pos_;
+  if (std::abs(travel_d) <= 1e-9) {
+    return true;
+  }
+
+  const double direction_d = travel_d < 0.0 ? -1.0 : 1.0;
+  const double distance_to_target_along_path =
+    (target_position_d - xhat_.p_d) * direction_d;
+  const double safe_accel = std::max(0.0, max_accel);
+  const double braking_distance =
+    safe_accel > 1e-9 ?
+    cruise_velocity_d * cruise_velocity_d / (2.0 * safe_accel) : 0.0;
+  const double capture_distance = std::max(
+    std::max(0.0, params.get_double("takeoff_position_tolerance")),
+    braking_distance);
+
+  return distance_to_target_along_path <= capture_distance;
+}
+
+void ControllerStateMachine::update_takeoff_safety(
+  double velocity_d,
+  double dt)
+{
+  const double safe_dt = std::max(0.0, dt);
+  const bool saturated_low = is_throttle_saturated_low();
+  const bool moving_upward = velocity_d < 0.0;
+  const double upward_speed = moving_upward ? -velocity_d : 0.0;
+
+  if (saturated_low) {
+    if (low_throttle_saturation_elapsed_ <= 0.0) {
+      low_saturation_start_upward_speed_ = upward_speed;
+    }
+    low_throttle_saturation_elapsed_ += safe_dt;
+  } else {
+    low_throttle_saturation_elapsed_ = 0.0;
+    low_saturation_start_upward_speed_ = upward_speed;
+  }
+
+  const double travel_d = params.get_double("takeoff_d_pos") - takeoff_start_d_pos_;
+  const double direction_d = travel_d < 0.0 ? -1.0 : 1.0;
+  const double overshoot = std::max(
+    0.0,
+    (xhat_.p_d - params.get_double("takeoff_d_pos")) * direction_d);
+  const double max_overshoot =
+    std::max(0.0, params.get_double("takeoff_max_overshoot"));
+  const double runaway_velocity =
+    std::max(0.0, params.get_double("takeoff_runaway_velocity"));
+  const double low_saturation_timeout =
+    std::max(0.0, params.get_double("takeoff_low_saturation_timeout"));
+  const double takeoff_timeout =
+    std::max(0.0, params.get_double("takeoff_timeout"));
+  const bool upward_speed_increasing =
+    saturated_low &&
+    moving_upward &&
+    upward_speed > low_saturation_start_upward_speed_ + 1e-3;
+
+  TakeoffAbortReason reason = TAKEOFF_ABORT_NONE;
+  if (overshoot > max_overshoot) {
+    reason = TAKEOFF_ABORT_ALTITUDE_OVERSHOOT;
+  } else if (
+    moving_upward &&
+    runaway_velocity > 0.0 &&
+    upward_speed > runaway_velocity)
+  {
+    reason = TAKEOFF_ABORT_RUNAWAY_VELOCITY;
+  } else if (
+    saturated_low &&
+    moving_upward &&
+    low_saturation_timeout > 0.0 &&
+    low_throttle_saturation_elapsed_ >= low_saturation_timeout &&
+    (upward_speed_increasing ||
+    (runaway_velocity > 0.0 && upward_speed >= runaway_velocity)))
+  {
+    reason = TAKEOFF_ABORT_LOW_THROTTLE_SATURATION;
+  } else if (
+    takeoff_timeout > 0.0 &&
+    takeoff_elapsed_time_ >= takeoff_timeout)
+  {
+    reason = TAKEOFF_ABORT_TIMEOUT;
+  }
+
+  if (reason != TAKEOFF_ABORT_NONE) {
+    abort_takeoff(reason);
+  }
+}
+
+void ControllerStateMachine::abort_takeoff(TakeoffAbortReason reason)
+{
+  takeoff_abort_reason_ = reason;
+  takeoff_phase_ = TAKEOFF_PHASE_ABORTED;
+  RCLCPP_ERROR_STREAM(
+    this->get_logger(),
+    "Aborting smooth takeoff, reason=" << static_cast<int>(reason) <<
+      ", elapsed=" << takeoff_elapsed_time_ <<
+      " s, low-throttle saturation=" <<
+      low_throttle_saturation_elapsed_ << " s");
+  state_ = TAKEOFF_ABORT;
+  state_transition_ = true;
+  reset_vertical_integrators();
 }
 
 double ControllerStateMachine::calculate_inertial_down_velocity() const
@@ -250,11 +441,44 @@ double ControllerStateMachine::update_smooth_takeoff_velocity(
 
 void ControllerStateMachine::transition_to_position_hold()
 {
+  const bool preserve_capture_integrators =
+    params.get_bool("smooth_takeoff_enabled") &&
+    takeoff_phase_ == TAKEOFF_CAPTURE;
   state_ = POSITION_HOLD;
   start_position_hold_time_ =
     xhat_.header.stamp.sec + xhat_.header.stamp.nanosec * 1e-9;
   state_transition_ = true;
-  reset_vertical_integrators();
+  takeoff_phase_ = TAKEOFF_PHASE_INACTIVE;
+
+  // TAKEOFF_CAPTURE and POSITION_HOLD use the same vertical position
+  // cascade. Preserve its learned hover command for a bumpless transition.
+  // Legacy takeoff still resets when it switches from velocity to position.
+  if (!preserve_capture_integrators) {
+    reset_vertical_integrators();
+  }
+}
+
+rosflight_msgs::msg::Command ControllerStateMachine::manage_takeoff_abort(
+  double dt)
+{
+  roscopter_msgs::msg::ControllerCommand input_cmd;
+  input_cmd.mode =
+    roscopter_msgs::msg::ControllerCommand::MODE_NPOS_EPOS_DPOS_YAW;
+  input_cmd.cmd1 = takeoff_n_pos_;
+  input_cmd.cmd2 = takeoff_e_pos_;
+  input_cmd.cmd3 = params.get_double("takeoff_d_pos");
+  input_cmd.cmd4 = takeoff_yaw_;
+  return compute_offboard_control(input_cmd, dt);
+}
+
+bool ControllerStateMachine::is_throttle_saturated_low() const
+{
+  return false;
+}
+
+void ControllerStateMachine::finalize_control_cycle(
+  const rosflight_msgs::msg::Command &)
+{
 }
 
 rosflight_msgs::msg::Command ControllerStateMachine::manage_position_hold(double dt)
@@ -291,10 +515,12 @@ rosflight_msgs::msg::Command ControllerStateMachine::manage_position_hold(double
   if (start_landing) {
     state_ = LANDING;
     state_transition_ = true;
+    takeoff_throttle_limit_active_ = false;
   }
   else if (start_offboard) {
     state_ = OFFBOARD;
     state_transition_ = true;
+    takeoff_throttle_limit_active_ = false;
   }
 
   return output_cmd;

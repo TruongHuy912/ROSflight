@@ -28,6 +28,7 @@ private:
   rosflight_msgs::msg::Command output_cmd_;
   double dt_;
   bool params_initialized_;
+  bool vertical_debug_initialized_;
   roscopter_msgs::msg::VerticalControlDebug vertical_debug_;
   rclcpp::Publisher<roscopter_msgs::msg::VerticalControlDebug>::SharedPtr vertical_debug_pub_;
 
@@ -59,8 +60,13 @@ private:
   void reset_integrators();
   void reset_vertical_integrators() override;
   void update_gains() override;
+  bool is_throttle_saturated_low() const override;
+  void finalize_control_cycle(
+    const rosflight_msgs::msg::Command & output_cmd) override;
   void initialize_vertical_debug();
   void publish_vertical_debug();
+  double get_active_min_throttle();
+  void update_vertical_acceleration_limits();
   // double calculate_max_xy_accel(double max_accel_z, double equilibrium_throttle);
 
   void declare_params();

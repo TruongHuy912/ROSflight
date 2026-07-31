@@ -1,5 +1,21 @@
 std_msgs/Header header
+
+uint8 TAKEOFF_PHASE_INACTIVE=0
+uint8 TAKEOFF_PHASE_RAMP=1
+uint8 TAKEOFF_PHASE_CAPTURE=2
+uint8 TAKEOFF_PHASE_ABORTED=3
+
+uint8 TAKEOFF_ABORT_NONE=0
+uint8 TAKEOFF_ABORT_TIMEOUT=1
+uint8 TAKEOFF_ABORT_LOW_THROTTLE_SATURATION=2
+uint8 TAKEOFF_ABORT_RUNAWAY_VELOCITY=3
+uint8 TAKEOFF_ABORT_ALTITUDE_OVERSHOOT=4
+
 uint8 controller_state
+uint8 takeoff_phase
+float32 takeoff_elapsed_time
+float32 low_throttle_saturation_elapsed
+uint8 takeoff_abort_reason
 float32 p_d
 float32 p_d_setpoint
 float32 position_error_d
@@ -10,6 +26,7 @@ float32 accel_command_unsaturated
 float32 accel_command_saturated
 float32 throttle_unsaturated
 float32 throttle_saturated
+float32 actual_output_command_u2
 float32 velocity_integrator
 bool throttle_saturated_high
 bool throttle_saturated_low
